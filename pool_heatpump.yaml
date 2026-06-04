@@ -1,0 +1,135 @@
+esphome:
+  name: pool_heatpump
+  friendly_name: Pool Heat Pump
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+  logs:
+    remote.raw: NONE
+
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  power_save_mode: none
+  output_power: 20dB
+  fast_connect: true
+
+  ap:
+    ssid: "Pool Heat Pump Fallback"
+    password: "ChangeMe123"
+
+captive_portal:
+
+# =========================================================
+# POOL HEAT PUMP BUS MONITOR
+# Tested with CC173C-V3.0 display board
+#
+# Hardware:
+# - ESP32 DevKit
+# - Bidirectional Logic Level Shifter
+# - 4-Channel Relay Module
+#
+# NET bus:
+# Blue  = NET Data
+# Yellow = GND
+# Red/Brown = +12V
+#
+# GPIO34 = NET bus input (via level shifter)
+# GPIO25 = Power button relay
+# GPIO26 = Mode button relay
+# GPIO27 = Temp Up button relay
+# GPIO32 = Temp Down button relay
+# =========================================================
+
+remote_receiver:
+  pin:
+    number: GPIO34
+    inverted: false
+    mode:
+      input: true
+      pullup: false
+
+  dump: raw
+  tolerance: 25%
+  filter: 50us
+  idle: 20ms
+  buffer_size: 10kb
+
+# --- Existing decoding logic here ---
+# (keep the rest of your published decoding code unchanged)
+
+switch:
+
+  - platform: gpio
+    id: wp_btn_power
+    pin:
+      number: GPIO25
+      inverted: true
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    id: wp_btn_mode
+    pin:
+      number: GPIO26
+      inverted: true
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    id: wp_btn_temp_up
+    pin:
+      number: GPIO27
+      inverted: true
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    id: wp_btn_temp_down
+    pin:
+      number: GPIO32
+      inverted: true
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+button:
+
+  - platform: template
+    name: "Power"
+    on_press:
+      - switch.turn_on: wp_btn_power
+      - delay: 300ms
+      - switch.turn_off: wp_btn_power
+
+  - platform: template
+    name: "Mode"
+    on_press:
+      - switch.turn_on: wp_btn_mode
+      - delay: 300ms
+      - switch.turn_off: wp_btn_mode
+
+  - platform: template
+    name: "Temperature Up"
+    on_press:
+      - switch.turn_on: wp_btn_temp_up
+      - delay: 300ms
+      - switch.turn_off: wp_btn_temp_up
+
+  - platform: template
+    name: "Temperature Down"
+    on_press:
+      - switch.turn_on: wp_btn_temp_down
+      - delay: 300ms
+      - switch.turn_off: wp_btn_temp_down
