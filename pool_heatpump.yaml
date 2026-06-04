@@ -36,21 +36,22 @@ captive_portal:
 # POOL HEAT PUMP BUS MONITOR
 # Tested with CC173C-V3.0 display board
 #
+# Display connector:
+# Blue       = NET / Data bus
+# Yellow     = GND
+# Red/Brown  = +12V display supply
+#
 # Hardware:
 # - ESP32 DevKit
-# - Bidirectional Logic Level Shifter
-# - 4-Channel Relay Module
+# - Bidirectional logic level shifter for NET bus input
+# - 4-channel opto-isolated relay module for button control
 #
-# NET bus:
-# Blue  = NET Data
-# Yellow = GND
-# Red/Brown = +12V
-#
-# GPIO34 = NET bus input (via level shifter)
+# ESP32 GPIO:
+# GPIO34 = NET bus input via level shifter
 # GPIO25 = Power button relay
 # GPIO26 = Mode button relay
-# GPIO27 = Temp Up button relay
-# GPIO32 = Temp Down button relay
+# GPIO27 = Temperature Up relay
+# GPIO32 = Temperature Down relay
 # =========================================================
 
 remote_receiver:
@@ -67,8 +68,303 @@ remote_receiver:
   idle: 20ms
   buffer_size: 10kb
 
-# --- Existing decoding logic here ---
-# (keep the rest of your published decoding code unchanged)
+  on_raw:
+    then:
+      - lambda: |-
+          if (x.size() < 20) return;
+
+          int32_t h1 = x[0];
+          int32_t h2 = x[1];
+
+          // Frame start
+          if (!(h1 < -8000 && h1 > -10500 && h2 > 3500 && h2 < 6000)) {
+            return;
+          }
+
+          std::vector<uint8_t> bytes;
+          uint8_t current_byte = 0;
+          int bit_index = 0;
+
+          for (size_t i = 2; i + 1 < x.size(); i += 2) {
+            int32_t mark = x[i];
+            int32_t space = x[i + 1];
+
+            if (!(mark < -700 && mark > -1600)) {
+              continue;
+            }
+
+            int bit;
+
+            if (space > 700 && space < 1800) {
+              bit = 1;
+            }
+            else if (space > 2200 && space < 4200) {
+              bit = 0;
+            }
+            else {
+              continue;
+            }
+
+            current_byte |= (bit << bit_index);
+            bit_index++;
+
+            if (bit_index == 8) {
+              bytes.push_back(current_byte);
+              current_byte = 0;
+              bit_index = 0;
+            }
+          }
+
+          if (bytes.size() < 3) return;
+
+          char frame_hex[256];
+          frame_hex[0] = '\0';
+
+          for (size_t i = 0; i < bytes.size() && i < 32; i++) {
+            char b[6];
+            sprintf(b, "%02X ", bytes[i]);
+            strcat(frame_hex, b);
+          }
+
+          ESP_LOGI("WPFRAME", "%s", frame_hex);
+
+          // =====================================================
+          // DD FRAME - temperatures / flow / max setpoint
+          // =====================================================
+
+          if (bytes[0] == 0xDD && bytes.size() >= 14) {
+            int water_in = bytes[1];
+            int water_out = bytes[2];
+            int coil = bytes[3];
+            int exhaust = bytes[4];
+            int ambient = bytes[5];
+            int flow_status = bytes[7];
+            int max_setpoint = bytes[12];
+
+            id(wp_water_in).publish_state(water_in);
+            id(wp_water_out).publish_state(water_out);
+            id(wp_coil_temp).publish_state(coil);
+            id(wp_exhaust_temp).publish_state(exhaust);
+            id(wp_ambient_temp).publish_state(ambient);
+            id(wp_max_setpoint).publish_state(max_setpoint);
+
+            id(wp_flow_ok).publish_state(flow_status != 0x04);
+            id(wp_no_flow).publish_state(flow_status == 0x04);
+
+            ESP_LOGI(
+              "WP",
+              "DD decoded: in=%d out=%d coil=%d exhaust=%d ambient=%d flow=%d max_sp=%d",
+              water_in,
+              water_out,
+              coil,
+              exhaust,
+              ambient,
+              flow_status,
+              max_setpoint
+            );
+          }
+
+          // =====================================================
+          // D2 FRAME - mode / setpoint / display page
+          // =====================================================
+
+          if (bytes[0] == 0xD2 && bytes.size() >= 9) {
+            uint8_t cooling_setpoint = bytes[1];
+            uint8_t heating_setpoint = bytes[2];
+            uint8_t mode1 = bytes[7];
+            uint8_t mode2 = bytes[8];
+
+            std::string mode = "Unknown";
+            std::string display_page = "Unknown";
+            int setpoint = 0;
+
+            if (mode1 == 0xEC) {
+              mode = "Heating";
+              display_page = "Water";
+              setpoint = heating_setpoint;
+            }
+            else if (mode1 == 0xCC && (mode2 & 0x80)) {
+              mode = "Auto";
+              display_page = "Water";
+              setpoint = mode2 & 0x7F;
+            }
+            else if (mode1 == 0xCC) {
+              mode = "Cooling";
+              display_page = "Water";
+              setpoint = cooling_setpoint;
+            }
+            else if (mode1 == 0x8C && (mode2 & 0x80)) {
+              mode = "Auto";
+              display_page = "Ambient";
+              setpoint = mode2 & 0x7F;
+            }
+            else if (mode1 == 0x8C) {
+              mode = "Cooling";
+              display_page = "Ambient";
+              setpoint = cooling_setpoint;
+            }
+
+            id(wp_setpoint).publish_state(setpoint);
+            id(wp_mode).publish_state(mode);
+            id(wp_display_page).publish_state(display_page);
+
+            ESP_LOGI(
+              "WP",
+              "D2 decoded: setpoint=%d mode=%s display=%s",
+              setpoint,
+              mode.c_str(),
+              display_page.c_str()
+            );
+          }
+
+# =========================================================
+# SENSORS
+# =========================================================
+
+sensor:
+
+  - platform: wifi_signal
+    name: "Pool Heat Pump WiFi RSSI"
+    update_interval: 30s
+
+  - platform: template
+    name: "WP Water In"
+    id: wp_water_in
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    name: "WP Water Out"
+    id: wp_water_out
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    name: "WP Setpoint"
+    id: wp_setpoint
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    name: "WP Max Setpoint"
+    id: wp_max_setpoint
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    name: "WP Ambient"
+    id: wp_ambient_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    name: "WP Coil"
+    id: wp_coil_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    name: "WP Exhaust"
+    id: wp_exhaust_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    name: "WP Delta Water"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      if (isnan(id(wp_water_in).state) || isnan(id(wp_water_out).state)) {
+        return {};
+      }
+      return id(wp_water_out).state - id(wp_water_in).state;
+
+# =========================================================
+# BINARY SENSORS
+# =========================================================
+
+binary_sensor:
+
+  - platform: template
+    name: "WP Flow OK"
+    id: wp_flow_ok
+    device_class: running
+
+  - platform: template
+    name: "WP No Flow"
+    id: wp_no_flow
+    device_class: problem
+
+  - platform: template
+    name: "WP Active"
+    id: wp_active
+    device_class: running
+    lambda: |-
+      if (
+        isnan(id(wp_water_in).state) ||
+        isnan(id(wp_water_out).state) ||
+        isnan(id(wp_coil_temp).state) ||
+        isnan(id(wp_exhaust_temp).state) ||
+        isnan(id(wp_ambient_temp).state)
+      ) {
+        return {};
+      }
+
+      bool exhaust_hot =
+        id(wp_exhaust_temp).state >
+        id(wp_ambient_temp).state + 10;
+
+      bool coil_cold =
+        id(wp_coil_temp).state <
+        id(wp_ambient_temp).state - 3;
+
+      bool water_heating =
+        id(wp_water_out).state >= id(wp_water_in).state;
+
+      return exhaust_hot && coil_cold && water_heating;
+
+# =========================================================
+# TEXT SENSORS
+# =========================================================
+
+text_sensor:
+
+  - platform: template
+    name: "WP Mode"
+    id: wp_mode
+    update_interval: never
+
+  - platform: template
+    name: "WP Display Page"
+    id: wp_display_page
+    update_interval: never
+
+# =========================================================
+# RELAY OUTPUTS
+# Each relay contact is wired in parallel with a display button
+# =========================================================
 
 switch:
 
@@ -104,31 +400,35 @@ switch:
     internal: true
     restore_mode: ALWAYS_OFF
 
+# =========================================================
+# HOME ASSISTANT BUTTONS
+# =========================================================
+
 button:
 
   - platform: template
-    name: "Power"
+    name: "WP Power Button"
     on_press:
       - switch.turn_on: wp_btn_power
       - delay: 300ms
       - switch.turn_off: wp_btn_power
 
   - platform: template
-    name: "Mode"
+    name: "WP Mode Button"
     on_press:
       - switch.turn_on: wp_btn_mode
       - delay: 300ms
       - switch.turn_off: wp_btn_mode
 
   - platform: template
-    name: "Temperature Up"
+    name: "WP Temperature Up"
     on_press:
       - switch.turn_on: wp_btn_temp_up
       - delay: 300ms
       - switch.turn_off: wp_btn_temp_up
 
   - platform: template
-    name: "Temperature Down"
+    name: "WP Temperature Down"
     on_press:
       - switch.turn_on: wp_btn_temp_down
       - delay: 300ms
